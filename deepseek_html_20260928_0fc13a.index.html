@@ -1,0 +1,263 @@
+<!DOCTYPE html>
+<html lang="uk">
+<head>
+  <meta charset="UTF-8">
+  <title>Моніторинг: траєкторії БПЛА та ракет</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+  <style>
+    html, body { margin:0; height:100%; background:#0a0e17; font-family: 'Segoe UI', monospace; }
+    #map { height:100%; width:100%; background:#0a0e17; }
+    .panel {
+      position:absolute; top:10px; right:10px; z-index:1000;
+      background:rgba(10,14,23,0.92); color:#e0e0e0;
+      padding:12px 16px; border-radius:8px; border:1px solid #2a3a55;
+      font-size:13px; min-width:260px; max-height:70vh; overflow-y:auto;
+    }
+    .panel h3 { margin:0 0 8px; color:#ff5555; font-size:14px; letter-spacing:1px; }
+    .log-entry { padding:4px 0; border-bottom:1px solid #1a2233; font-size:12px; }
+    .log-entry .t { color:#6a7a99; }
+    .drone { color:#ffcc00; }
+    .missile { color:#ff4444; }
+    .ballistic { color:#ff00aa; }
+    .legend { position:absolute; bottom:10px; left:10px; z-index:1000;
+      background:rgba(10,14,23,0.92); color:#ccc; padding:10px 14px;
+      border-radius:8px; font-size:12px; border:1px solid #2a3a55; }
+    .legend div { margin:3px 0; }
+    .dot { display:inline-block; width:10px; height:10px; border-radius:50%; margin-right:6px; }
+    .pulse { animation: pulse 1.2s infinite; }
+    @keyframes pulse {
+      0%,100% { opacity:1; transform:scale(1); }
+      50% { opacity:0.4; transform:scale(1.6); }
+    }
+    .trail { stroke-linecap:round; }
+  </style>
+</head>
+<body>
+<div id="map"></div>
+
+<div class="panel">
+  <h3>⚠️ АКТИВНІ ЦІЛІ</h3>
+  <div id="targets"></div>
+  <h3 style="margin-top:14px; color:#6a7a99;">📜 ІСТОРІЯ (24 год)</h3>
+  <div id="log"></div>
+</div>
+
+<div class="legend">
+  <div><span class="dot" style="background:#ffcc00;"></span>БПЛА (Shahed)</div>
+  <div><span class="dot" style="background:#ff4444;"></span>Крилата ракета</div>
+  <div><span class="dot" style="background:#ff00aa;"></span>Балістика / Циркон</div>
+  <div><span class="dot" style="background:#00ff88;"></span>Перехоплено</div>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+// ============ КАРТА ============
+const map = L.map('map', {
+  center: [50.45, 30.52],   // Київ
+  zoom: 8,
+  zoomControl: true,
+  preferCanvas: true
+});
+
+// Тёмная тема (CartoDB Dark Matter)
+L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
+  attribution: '&copy; OpenStreetMap &copy; CARTO',
+  subdomains: 'abcd',
+  maxZoom: 19
+}).addTo(map);
+
+// ============ ДАННЫЕ ДЛЯ ДЕМО ============
+// Каждая цель: тип, точки маршрута [lat, lng], скорость (точек/сек), статус
+const demoTargets = [
+  {
+    id: 'sh1',
+    type: 'drone',
+    color: '#ffcc00',
+    icon: '✈',
+    label: 'Shahed-136',
+    path: [
+      [51.73, 35.00], // Курская обл.
+      [51.40, 34.20],
+      [51.10, 33.40],
+      [50.80, 32.60],
+      [50.60, 31.80],
+      [50.50, 31.00],
+      [50.45, 30.52]  // Киев
+    ]
+  },
+  {
+    id: 'ms1',
+    type: 'missile',
+    color: '#ff4444',
+    icon: '🚀',
+    label: 'Крилата (Курськ)',
+    path: [
+      [51.73, 35.00],
+      [51.20, 34.00],
+      [50.80, 32.80],
+      [50.55, 31.60],
+      [50.45, 30.52]
+    ]
+  },
+  {
+    id: 'zb1',
+    type: 'ballistic',
+    color: '#ff00aa',
+    icon: '⚡',
+    label: 'Циркон',
+    path: [
+      [44.60, 33.53], // Чорне море / Крим
+      [45.50, 32.50],
+      [47.00, 31.50],
+      [49.00, 31.00],
+      [50.20, 30.60],
+      [50.45, 30.52]
+    ]
+  }
+];
+
+// ============ СОСТОЯНИЕ ============
+const activeTargets = new Map(); // id -> { marker, trail, polyline, currentIdx, completed }
+const historyLog = [];           // { time, text, color }
+const TTL_MS = 24 * 60 * 60 * 1000;
+const tickInterval = 400;        // мс между шагами
+
+// ============ СОЗДАНИЕ ЦЕЛИ ============
+function createTarget(t) {
+  const polyline = L.polyline([], {
+    color: t.color, weight: 2, opacity: 0.85,
+    className: 'trail', dashArray: '6,6'
+  }).addTo(map);
+
+  const marker = L.marker(t.path[0], {
+    icon: L.divIcon({
+      className: '',
+      html: `<div style="
+        width:18px;height:18px;border-radius:50%;
+        background:${t.color};box-shadow:0 0 12px ${t.color};
+        display:flex;align-items:center;justify-content:center;
+        font-size:11px;color:#000;font-weight:bold;">${t.icon}</div>`,
+      iconSize: [18,18],
+      iconAnchor: [9,9]
+    })
+  }).addTo(map);
+
+  marker.bindTooltip(`${t.label}`, { permanent: false, direction: 'top' });
+
+  activeTargets.set(t.id, {
+    def: t, marker, polyline,
+    idx: 0,
+    trailPoints: [t.path[0]],
+    completed: false
+  });
+
+  addLog(`Виявлено: ${t.label}`, t.color);
+}
+
+// ============ ШАГ АНИМАЦИИ ============
+function step() {
+  activeTargets.forEach((state, id) => {
+    if (state.completed) return;
+    const { def, marker, polyline } = state;
+    state.idx++;
+
+    if (state.idx >= def.path.length) {
+      // Достиг цели
+      state.completed = true;
+      marker.setIcon(L.divIcon({
+        className: '',
+        html: `<div class="pulse" style="
+          width:22px;height:22px;border-radius:50%;
+          background:#ff0033;box-shadow:0 0 20px #ff0033;"></div>`,
+        iconSize: [22,22], iconAnchor: [11,11]
+      }));
+      addLog(`💥 ${def.label} — фіксація в районі цілі`, '#ff0033');
+      // Автоудаление через 30 сек после "прилёта"
+      setTimeout(() => removeTarget(id), 30000);
+      return;
+    }
+
+    const pos = def.path[state.idx];
+    marker.setLatLng(pos);
+    state.trailPoints.push(pos);
+    polyline.setLatLngs(state.trailPoints);
+
+    // Автоповорот карты, если цель ушла за край
+    const bounds = map.getBounds();
+    if (!bounds.contains(pos)) map.panTo(pos, { animate: true });
+  });
+
+  renderTargetsPanel();
+}
+
+// ============ УДАЛЕНИЕ ============
+function removeTarget(id) {
+  const s = activeTargets.get(id);
+  if (!s) return;
+  map.removeLayer(s.marker);
+  map.removeLayer(s.polyline);
+  activeTargets.delete(id);
+  renderTargetsPanel();
+}
+
+// ============ ПАНЕЛЬ АКТИВНЫХ ============
+function renderTargetsPanel() {
+  const el = document.getElementById('targets');
+  if (activeTargets.size === 0) {
+    el.innerHTML = '<div style="color:#556;">Немає активних цілей</div>';
+    return;
+  }
+  el.innerHTML = [...activeTargets.values()].map(s => {
+    const cls = s.def.type;
+    const status = s.completed ? '💥' : '🛫';
+    return `<div class="log-entry ${cls}">
+      ${status} ${s.def.label}
+      <span class="t">— крок ${s.idx}/${s.def.path.length}</span>
+    </div>`;
+  }).join('');
+}
+
+// ============ ЖУРНАЛ (24 год, автоочистка) ============
+function addLog(text, color = '#ccc') {
+  historyLog.push({ time: Date.now(), text, color });
+  cleanupLog();
+  renderLog();
+}
+
+function cleanupLog() {
+  const cutoff = Date.now() - TTL_MS;
+  for (let i = historyLog.length - 1; i >= 0; i--) {
+    if (historyLog[i].time < cutoff) historyLog.splice(i, 1);
+  }
+}
+
+function renderLog() {
+  const el = document.getElementById('log');
+  el.innerHTML = historyLog.slice(-40).reverse().map(e => {
+    const t = new Date(e.time).toLocaleTimeString('uk-UA');
+    return `<div class="log-entry">
+      <span class="t">[${t}]</span>
+      <span style="color:${e.color}">${e.text}</span>
+    </div>`;
+  }).join('');
+}
+
+// ============ СТАРТ ============
+demoTargets.forEach(createTarget);
+setInterval(step, tickInterval);
+setInterval(cleanupLog, 60000); // чистка раз в минуту
+
+// ============ СОХРАНЕНИЕ В localStorage (опционально) ============
+// Для реальной персистентности истории между перезагрузками:
+window.addEventListener('beforeunload', () => {
+  localStorage.setItem('monitor_log', JSON.stringify(historyLog));
+});
+window.addEventListener('load', () => {
+  const saved = JSON.parse(localStorage.getItem('monitor_log') || '[]');
+  const cutoff = Date.now() - TTL_MS;
+  saved.filter(e => e.time > cutoff).forEach(e => historyLog.push(e));
+  renderLog();
+});
+</script>
+</body>
+</html>
